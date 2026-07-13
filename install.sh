@@ -277,9 +277,12 @@ start_server() {
                     model_env=(-e MODEL="$HYBRID_REPO" -e INC_HYBRID=1 -e INT8_LMHEAD_V3=1)  # prebuilt hybrid from the HF cache
                 fi ;;
         base)   nspec="${NSPEC:-0}"; serve_args="$nspec $BACKEND" ;;
-        mtp)    nspec="${NSPEC:-2}"; serve_args="$nspec $BACKEND" ;;
+        mtp)    nspec="${NSPEC:-3}"; serve_args="$nspec $BACKEND"
+                model_env=(-e MODEL=/model/qwen35-122b-hybrid-int4fp8 -e INC_HYBRID=1 -e INT8_LMHEAD_V3=1)   # locally-built hybrid
+                mounts=(-v "/home/saren/models:/model:ro")
+                ;;
     esac
-    if [[ -n "$MODEL_DIR" && "$PROFILE" != "dense" ]]; then
+    if [[ -n "$MODEL_DIR" && "$PROFILE" != "dense" && "$PROFILE" != "mtp" ]]; then
         model_env=(-e MODEL=/model); mounts=(-v "$MODEL_DIR:/model:ro")
     fi
     local wrapper="/host/serve.sh"; [[ "$PROFILE" == "mtp" ]] && wrapper="/host/mtp_serve.sh"

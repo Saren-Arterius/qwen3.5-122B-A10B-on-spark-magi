@@ -98,6 +98,9 @@ else
   PREFIX_ARG=(--no-enable-prefix-caching)
 fi
 
+set -x
+cd /usr/local/lib/python3.12/site-packages/vllm; patch -p2 < /host/40270.diff
+
 exec vllm serve "$MODEL" \
   --served-model-name qwen \
   --host 0.0.0.0 --port "$PORT" \
@@ -108,6 +111,10 @@ exec vllm serve "$MODEL" \
   "${PREFIX_ARG[@]}" \
   --enable-chunked-prefill \
   --trust-remote-code \
+	--chat-template /host/Qwen3.5-122B-A10B_ha.jinja \
+	--scheduling-policy priority \
+	--optimization-level 3 \
+	--performance-mode throughput \
   --load-format "$LOAD_FORMAT" \
   --attention-backend "$BACKEND" \
   "${TOOL_ARG[@]}" \
