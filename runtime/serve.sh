@@ -98,9 +98,34 @@ else
   PREFIX_ARG=(--no-enable-prefix-caching)
 fi
 
-set -x
-cd /usr/local/lib/python3.12/site-packages/vllm; patch -p2 < /host/40270.diff
+# ARC KV-cache eviction (vLLM PR #40270) + the never-evict prompt pin, as one
+# regenerated zero-fuzz patch. This replaces the old 40270.diff, which applied
+# with fuzz 1-2 across 15 hunks (one hunk header was malformed) and whose
+# free_blocks(prepend=True) branch was a no-op. Regenerated against this exact
+# image, so any hunk failure here means the image changed -> regenerate.
+# Sentinel-guarded: without it, `docker start` on an existing container re-runs
+# this script against an already-patched tree and `patch` exits 1, which under
+# `set -e` kills the server before it boots.
+VLLM_PKG=/usr/local/lib/python3.12/site-packages/vllm
+if [ -f "$VLLM_PKG/v1/core/eviction_policy.py" ]; then
+  echo "[serve] ARC + never-evict patch already applied — skipping"
+else
+  echo "[serve] ARC eviction + never-evict KV pin patch"
+  (cd "$VLLM_PKG" && patch -p2 -N -r - < /host/arc_pin.diff)
+fi
 
+# Pin the Home Assistant system prompt's KV blocks so a burst of unrelated
+# traffic can't evict them (cold re-prefill of that preamble is ~2.3s of TTFT vs
+# ~0.18s warm). Any request whose prompt contains this sentence has its blocks
+# held out of the free pool until the next matching request replaces the set —
+# so a changed HA prompt releases the old blocks by itself. Capped at 10% of the
+# pool. Single-quoted: the sentence contains double quotes. Set
+# NEVER_EVICT_PROMPT="" to disable.
+NEVER_EVICT_PROMPT="${NEVER_EVICT_PROMPT-You are \"Magi AI\", a smart home AI (via Home Assistant) and general knowledge assistant.}"
+PIN_ARG=()
+[ -n "$NEVER_EVICT_PROMPT" ] && PIN_ARG+=(--never-evict-kv-cache-prompt-includes "$NEVER_EVICT_PROMPT")
+
+set -x
 exec vllm serve "$MODEL" \
   --served-model-name qwen \
   --host 0.0.0.0 --port "$PORT" \
@@ -118,4 +143,5 @@ exec vllm serve "$MODEL" \
   --load-format "$LOAD_FORMAT" \
   --attention-backend "$BACKEND" \
   "${TOOL_ARG[@]}" \
+  "${PIN_ARG[@]}" \
   "${SPEC_ARG[@]}"
