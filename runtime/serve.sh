@@ -99,31 +99,57 @@ else
 fi
 
 # ARC KV-cache eviction (vLLM PR #40270) + the never-evict prompt pin, as one
-# regenerated zero-fuzz patch. This replaces the old 40270.diff, which applied
-# with fuzz 1-2 across 15 hunks (one hunk header was malformed) and whose
-# free_blocks(prepend=True) branch was a no-op. Regenerated against this exact
-# image, so any hunk failure here means the image changed -> regenerate.
+# regenerated zero-fuzz patch. Regenerated against this exact image, so any hunk
+# failure here means the image changed -> regenerate.
+#
+# arc_pin2.diff supersedes arc_pin.diff: v1 keyed the pin on the block *ids* the
+# request still held when it finished, which cannot work on a hybrid model.
+# MambaManager.get_num_skipped_tokens() is num_computed_tokens - 1, so
+# remove_skipped_blocks() — which allocate_slots() runs every step — frees the
+# GDN/mamba state blocks mid-request, hashes intact, back into the ARC pool. The
+# finish-time snapshot never saw them, churn evicted them, and since
+# HybridKVCacheCoordinator.find_longest_cache_hit is a fixed point across all 9
+# groups, that one group's miss truncated hit_length to 0 for everybody: the
+# pinned attention blocks sat there holding 9.6% of the pool while HA re-prefilled
+# all 8.6k tokens. v2 pins block *hashes*, armed when the request arrives, and
+# claims each block as it is freed — whenever in the request's life that happens.
 # Sentinel-guarded: without it, `docker start` on an existing container re-runs
 # this script against an already-patched tree and `patch` exits 1, which under
 # `set -e` kills the server before it boots.
 VLLM_PKG=/usr/local/lib/python3.12/site-packages/vllm
-if [ -f "$VLLM_PKG/v1/core/eviction_policy.py" ]; then
+if [ -f "$VLLM_PKG/.arc_pin2_applied" ]; then
   echo "[serve] ARC + never-evict patch already applied — skipping"
+elif [ -f "$VLLM_PKG/v1/core/eviction_policy.py" ]; then
+  # Old arc_pin.diff container: the tree is modified, so arc_pin2.diff cannot
+  # apply. Silently serving v1 here is worse than failing — that is the bug.
+  echo "[serve] FATAL: this container carries the superseded arc_pin.diff." >&2
+  echo "[serve] Recreate it (docker rm -f + ./install.sh --start) to pick up arc_pin2." >&2
+  exit 1
 else
-  echo "[serve] ARC eviction + never-evict KV pin patch"
-  (cd "$VLLM_PKG" && patch -p2 -N -r - < /host/arc_pin.diff)
+  echo "[serve] ARC eviction + never-evict KV pin patch (v2, hash-keyed)"
+  (cd "$VLLM_PKG" && patch -p2 -N -r - < /host/arc_pin2.diff)
+  touch "$VLLM_PKG/.arc_pin2_applied"
 fi
 
 # Pin the Home Assistant system prompt's KV blocks so a burst of unrelated
 # traffic can't evict them (cold re-prefill of that preamble is ~2.3s of TTFT vs
-# ~0.18s warm). Any request whose prompt contains this sentence has its blocks
-# held out of the free pool until the next matching request replaces the set —
-# so a changed HA prompt releases the old blocks by itself. Capped at 10% of the
-# pool. Single-quoted: the sentence contains double quotes. Set
-# NEVER_EVICT_PROMPT="" to disable.
+# ~0.18s warm). Any request whose prompt contains this sentence has the hashes of
+# its prefix pinned, in every KV cache group, until the next matching request
+# replaces the set — so a changed HA prompt releases the old blocks by itself.
+# Single-quoted: the sentence contains double quotes. Set NEVER_EVICT_PROMPT=""
+# to disable.
+#
+# The pin holds blocks out of the free count, so it is capped at a fraction of
+# the pool. A hybrid model pins in *every* group, so the cost is a multiple of
+# the attention-only figure — watch for "[never-evict] holding N blocks" and the
+# cap warning, and raise NEVER_EVICT_MAX_FRACTION if the cap bites.
 NEVER_EVICT_PROMPT="${NEVER_EVICT_PROMPT-You are \"Magi AI\", a smart home AI (via Home Assistant) and general knowledge assistant.}"
+NEVER_EVICT_MAX_FRACTION="${NEVER_EVICT_MAX_FRACTION:-0.25}"
 PIN_ARG=()
-[ -n "$NEVER_EVICT_PROMPT" ] && PIN_ARG+=(--never-evict-kv-cache-prompt-includes "$NEVER_EVICT_PROMPT")
+if [ -n "$NEVER_EVICT_PROMPT" ]; then
+  PIN_ARG+=(--never-evict-kv-cache-prompt-includes "$NEVER_EVICT_PROMPT")
+  PIN_ARG+=(--never-evict-kv-cache-max-fraction "$NEVER_EVICT_MAX_FRACTION")
+fi
 
 set -x
 exec vllm serve "$MODEL" \

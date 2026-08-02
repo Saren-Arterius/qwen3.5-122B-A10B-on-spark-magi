@@ -1,5 +1,5 @@
 diff --git a/vllm/config/cache.py b/vllm/config/cache.py
-index 352ccec..b219eaf 100644
+index 352ccec..861adec 100644
 --- a/vllm/config/cache.py
 +++ b/vllm/config/cache.py
 @@ -5,6 +5,8 @@ from collections.abc import Callable
@@ -11,7 +11,7 @@ index 352ccec..b219eaf 100644
  from pydantic import Field, field_validator, model_validator
  
  from vllm.config.utils import config
-@@ -176,6 +178,42 @@ class CacheConfig:
+@@ -176,6 +178,52 @@ class CacheConfig:
      'native' (vLLM native CPU offloading), 'lmcache'.
      KV offloading is only activated when kv_offloading_size is set."""
  
@@ -48,24 +48,35 @@ index 352ccec..b219eaf 100644
 +    Intended for a long, fixed system prompt shared by every request from one
 +    client (e.g. a Home Assistant agent), where re-prefilling the preamble
 +    dominates TTFT. Requires prefix caching and ``gpu_eviction_policy="arc"``;
-+    ignored otherwise. The pinned set is capped at 10% of the block pool so
-+    that long requests stay schedulable."""
++    ignored otherwise. Capped by
++    ``never_evict_kv_cache_max_fraction`` so that long requests stay
++    schedulable."""
++
++    never_evict_kv_cache_max_fraction: float = 0.25
++    """Upper bound on the never-evict pin, as a fraction of the GPU block pool.
++
++    Pinned blocks are excluded from the free count, so this is what stops a
++    long marked prompt from starving everything else. A hybrid model pins in
++    *every* KV cache group, so the cost is a multiple of the attention-only
++    figure — check the ``[never-evict] holding ...`` log line for the real
++    number on your model and raise this if the cap warning fires."""
 +
      def compute_hash(self) -> str:
          """
          WARNING: Whenever a new field is added to this config,
-@@ -206,6 +244,9 @@ class CacheConfig:
+@@ -206,6 +254,10 @@ class CacheConfig:
              "num_cpu_blocks",
              # WIP feature toggle not impacting compiled graph shape
              "kv_sharing_fast_prefill",
 +            # Eviction policy only affects scheduling, not the compute graph
 +            "gpu_eviction_policy",
 +            "never_evict_kv_cache_prompt_includes",
++            "never_evict_kv_cache_max_fraction",
          }
  
          from vllm.config.utils import get_hash_factors, hash_factors
 diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
-index 0490cbc..6e67a00 100644
+index 0490cbc..77bc86d 100644
 --- a/vllm/engine/arg_utils.py
 +++ b/vllm/engine/arg_utils.py
 @@ -65,6 +65,7 @@ from vllm.config import (
@@ -76,7 +87,7 @@ index 0490cbc..6e67a00 100644
      KVOffloadingBackend,
      MambaCacheMode,
      MambaDType,
-@@ -702,6 +703,10 @@ class EngineArgs:
+@@ -702,6 +703,13 @@ class EngineArgs:
  
      kv_offloading_size: float | None = CacheConfig.kv_offloading_size
      kv_offloading_backend: KVOffloadingBackend = CacheConfig.kv_offloading_backend
@@ -84,10 +95,13 @@ index 0490cbc..6e67a00 100644
 +    never_evict_kv_cache_prompt_includes: str | None = (
 +        CacheConfig.never_evict_kv_cache_prompt_includes
 +    )
++    never_evict_kv_cache_max_fraction: float = (
++        CacheConfig.never_evict_kv_cache_max_fraction
++    )
      tokens_only: bool = False
  
      shutdown_timeout: int = 0
-@@ -1167,6 +1172,13 @@ class EngineArgs:
+@@ -1167,6 +1175,17 @@ class EngineArgs:
          cache_group.add_argument(
              "--kv-offloading-backend", **cache_kwargs["kv_offloading_backend"]
          )
@@ -98,10 +112,14 @@ index 0490cbc..6e67a00 100644
 +            "--never-evict-kv-cache-prompt-includes",
 +            **cache_kwargs["never_evict_kv_cache_prompt_includes"],
 +        )
++        cache_group.add_argument(
++            "--never-evict-kv-cache-max-fraction",
++            **cache_kwargs["never_evict_kv_cache_max_fraction"],
++        )
  
          # Model weight offload related configs
          offload_kwargs = get_kwargs(OffloadConfig)
-@@ -1775,6 +1787,10 @@ class EngineArgs:
+@@ -1775,6 +1794,13 @@ class EngineArgs:
              mamba_cache_mode=self.mamba_cache_mode,
              kv_offloading_size=self.kv_offloading_size,
              kv_offloading_backend=self.kv_offloading_backend,
@@ -109,15 +127,14 @@ index 0490cbc..6e67a00 100644
 +            never_evict_kv_cache_prompt_includes=(
 +                self.never_evict_kv_cache_prompt_includes
 +            ),
++            never_evict_kv_cache_max_fraction=(
++                self.never_evict_kv_cache_max_fraction
++            ),
          )
  
          if resolved_cache_dtype.startswith("turboquant_"):
-diff --git a/vllm/v1/core/__pycache__/block_pool.cpython-314.pyc b/vllm/v1/core/__pycache__/block_pool.cpython-314.pyc
-new file mode 100644
-index 0000000..6a5dce1
-Binary files /dev/null and b/vllm/v1/core/__pycache__/block_pool.cpython-314.pyc differ
 diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
-index 4202f52..53c6213 100644
+index 4202f52..c201e04 100644
 --- a/vllm/v1/core/block_pool.py
 +++ b/vllm/v1/core/block_pool.py
 @@ -11,6 +11,7 @@ from vllm.distributed.kv_events import (
@@ -264,43 +281,34 @@ index 4202f52..53c6213 100644
 +        # Drop never-evict pins first: they are held out of the free count, so
 +        # otherwise this would report the pinned blocks as "not freed yet" and
 +        # fail forever.
-+        self._policy.set_pinned([])
++        self._policy.set_pinned_hashes(set(), 0)
 +
          num_used_blocks = self.num_gpu_blocks - self.get_num_free_blocks()
          if num_used_blocks != 1:  # The null block is always marked as used
              logger.warning(
-@@ -494,13 +544,43 @@ class BlockPool:
+@@ -494,13 +544,34 @@ class BlockPool:
  
          return True
  
-+    def set_pinned_blocks(self, block_ids: list[int]) -> set[int]:
-+        """Replace the never-evict block set, returning the ids actually pinned.
++    def set_pinned_hashes(
++        self, hashes: set[BlockHashWithGroupId], max_fraction: float
++    ) -> int:
++        """Replace the never-evict hash set. Returns the blocks reserved so far.
 +
-+        *block_ids* must be in the caller's eviction/prefix order: the head of
-+        the list is kept when the cap bites, since that is the shared prefix.
++        Pinned blocks are held out of the free count, so an uncapped pin could
++        starve a long request. *max_fraction* bounds the pin as a share of the
++        pool; the hash set itself is unbounded (it is metadata, not memory).
 +        """
-+        # ponytail: cap at 25% of the pool. Pinned blocks are held out of the
-+        # free count, so an uncapped pin could starve a long request. A hybrid
-+        # model allocates blocks in *every* KV cache group (9 here), so the
-+        # pinned cost is ~9x the attention-only cost: an 8.7k-token prompt
-+        # needs ~75 blocks of a 563-block pool. 25% leaves ~420 blocks, still
-+        # well above the ~295 a full 262k-token request needs.
-+        cap = max(1, self.num_gpu_blocks // 4)
-+        ids = {b for b in block_ids[:cap] if b != self.null_block.block_id}
-+        if len(block_ids) > cap:
-+            # A truncated pin is worse than useless: a prefix only hits when
-+            # every group's blocks survive, so half a pin buys nothing while
-+            # still holding memory hostage.
-+            logger.warning(
-+                "[never-evict] pin truncated: request needs %d blocks but the "
-+                "cap is %d (25%% of %d). The prefix will not stay resident — "
-+                "shorten the marked prompt or raise the cap.",
-+                len(block_ids),
-+                cap,
-+                self.num_gpu_blocks,
-+            )
-+        self._policy.set_pinned([self.blocks[i] for i in ids])
-+        return ids
++        cap = max(1, int(self.num_gpu_blocks * max_fraction))
++        return self._policy.set_pinned_hashes(hashes, cap)
++
++    def get_pin_stats(self) -> tuple[int, int, dict[int, int]]:
++        """(blocks reserved, blocks held in the pin queue, per-group counts)."""
++        return (
++            self._policy.pin_size,
++            self._policy.pin_held,
++            self._policy.pin_group_counts(),
++        )
 +
      def get_num_free_blocks(self) -> int:
          """Get the number of free blocks in the pool.
@@ -317,10 +325,10 @@ index 4202f52..53c6213 100644
          """Get the KV cache usage.
 diff --git a/vllm/v1/core/eviction_policy.py b/vllm/v1/core/eviction_policy.py
 new file mode 100644
-index 0000000..d3da580
+index 0000000..09778fa
 --- /dev/null
 +++ b/vllm/v1/core/eviction_policy.py
-@@ -0,0 +1,519 @@
+@@ -0,0 +1,611 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Pluggable eviction policies for the GPU KV cache BlockPool."""
@@ -328,11 +336,15 @@ index 0000000..d3da580
 +from abc import ABC, abstractmethod
 +from collections import OrderedDict
 +
++from vllm.logger import init_logger
 +from vllm.v1.core.kv_cache_utils import (
 +    BlockHashWithGroupId,
 +    FreeKVCacheBlockQueue,
 +    KVCacheBlock,
++    get_group_id,
 +)
++
++logger = init_logger(__name__)
 +
 +
 +class GPUCachePolicy(ABC):
@@ -379,13 +391,19 @@ index 0000000..d3da580
 +    def __len__(self) -> int:
 +        """Number of blocks currently available for eviction."""
 +
-+    def set_pinned(self, blocks: list[KVCacheBlock]) -> int:
-+        """Replace the set of never-evict blocks. Returns the new size.
++    def set_pinned_hashes(
++        self, hashes: set[BlockHashWithGroupId], cap: int
++    ) -> int:
++        """Replace the never-evict hash set. Returns the blocks now reserved.
 +
-+        Pinned blocks are excluded from ``__len__`` (so the scheduler never
-+        counts them as free and therefore never asks for them) and are never
-+        returned by ``evict_n``.  Policies that do not support pinning ignore
-+        the request.
++        The pin is keyed on block *hash*, not block id: a hybrid model hands
++        cached blocks back mid-request, so any set of ids captured at one
++        instant is already stale (see ARCGPUCachePolicy for the full story).
++
++        Blocks holding a pinned hash are excluded from ``__len__`` (so the
++        scheduler never counts them as free and therefore never asks for them)
++        and are never returned by ``evict_n``.  *cap* bounds how many blocks
++        may be held.  Policies that do not support pinning ignore the request.
 +        """
 +        return 0
 +
@@ -604,13 +622,35 @@ index 0000000..d3da580
 +        self._b1: OrderedDict[BlockHashWithGroupId, None] = OrderedDict()
 +        self._b2: OrderedDict[BlockHashWithGroupId, None] = OrderedDict()
 +
-+        # Pinned ("never evict") blocks — see set_pinned(). Held in their own
-+        # queue so evict_n() never walks them, and excluded from __len__() so
-+        # the scheduler never counts them as free and therefore never asks for
-+        # them (this is what keeps a hard pin from raising "Cannot get N free
-+        # blocks"). Capped by the caller; see BlockPool.set_pinned_blocks.
++        # Pinned ("never evict") blocks — see set_pinned_hashes(). Held in
++        # their own queue so evict_n() never walks them, and excluded from
++        # __len__() so the scheduler never counts them as free and therefore
++        # never asks for them (this is what keeps a hard pin from raising
++        # "Cannot get N free blocks").
++        #
++        # The pin is keyed on block *hash*, never on block id. A hybrid model
++        # releases cached blocks in the middle of a request:
++        # MambaManager.get_num_skipped_tokens() returns num_computed_tokens - 1,
++        # so remove_skipped_blocks() — which allocate_slots() calls every step —
++        # nulls the block-table slot and free_blocks() the state block, hash
++        # intact, back into T1/T2. A set of ids read off the block table when
++        # the request finishes therefore misses exactly the blocks a mamba/GDN
++        # group needs to hit its prefix, and since
++        # HybridKVCacheCoordinator.find_longest_cache_hit is a fixed point over
++        # all groups, that one group's miss truncates hit_length to 0 for
++        # everybody. Hash-keyed, blocks get pinned whenever they are freed.
++        self._pinned_hashes: set[BlockHashWithGroupId] = set()
++        self._pin_cap: int = 0
 +        self._pin: FreeKVCacheBlockQueue = FreeKVCacheBlockQueue([])
++        # Derived: which block currently holds each pinned hash. Duplicate
++        # blocks under one hash are legal (BlockHashToBlockMap NOTE #1) but only
++        # one can serve the hit, so only one is worth holding.
++        self._pinned_by_hash: dict[BlockHashWithGroupId, int] = {}
++        # Derived: ids sitting in _pin right now. A pinned block on loan
++        # (ref_cnt > 0) keeps its _pinned_by_hash reservation but leaves this
++        # set, which is what lets remove() pick the right queue in O(1).
 +        self._pinned_ids: set[int] = set()
++        self._pin_cap_warned: bool = False
 +
 +    # ------------------------------------------------------------------
 +    # GPUCachePolicy interface
@@ -646,9 +686,9 @@ index 0000000..d3da580
 +                # Ghost hit → promote.
 +                self._t2_ids.add(block.block_id)
 +
-+        if block.block_id in self._pinned_ids:
-+            self._pin.append(block)
-+        elif block.block_id in self._t2_ids:
++        if self._acquire_pin(block):
++            return
++        if block.block_id in self._t2_ids:
 +            self._t2.append(block)
 +        else:
 +            self._t1.append(block)
@@ -661,13 +701,55 @@ index 0000000..d3da580
 +    def insert_n_front(self, blocks: list[KVCacheBlock]) -> None:
 +        # Blocks the caller wants reused first: straight to the head of T1,
 +        # skipping ghost-hit promotion. Demote so remove() finds them there.
++        # A pinned block still wins — "reuse this first" must not override
++        # "never evict this" — though in practice these are unhashed scratch
++        # blocks that can never match a pinned hash.
++        rest: list[KVCacheBlock] = []
 +        for b in blocks:
++            if self._acquire_pin(b):
++                continue
 +            self._t2_ids.discard(b.block_id)
-+            self._pinned_ids.discard(b.block_id)
-+        self._t1.prepend_n(blocks)
++            rest.append(b)
++        if rest:
++            self._t1.prepend_n(rest)
++
++    def _acquire_pin(self, block: KVCacheBlock) -> bool:
++        """Put *block* in the pin queue if its hash is pinned. True if pinned.
++
++        Called from every insert path, so a block gets held the moment it is
++        freed — including the mid-request frees from remove_skipped_blocks()
++        that a finish-time snapshot cannot see.
++        """
++        key = block.block_hash
++        if key is None or key not in self._pinned_hashes:
++            return False
++        holder = self._pinned_by_hash.get(key)
++        if holder is None:
++            if len(self._pinned_by_hash) >= self._pin_cap:
++                if not self._pin_cap_warned:
++                    self._pin_cap_warned = True
++                    logger.warning(
++                        "[never-evict] pin cap reached at %d blocks: the "
++                        "marked prefix does not fit and will not stay "
++                        "resident. Shorten it or raise "
++                        "--never-evict-kv-cache-max-fraction.",
++                        self._pin_cap,
++                    )
++                return False
++            self._pinned_by_hash[key] = block.block_id
++        elif holder != block.block_id:
++            # A different block already holds this hash. Only one of them can
++            # serve the prefix hit, so pinning both just burns pool.
++            return False
++        self._pinned_ids.add(block.block_id)
++        self._pin.append(block)
++        return True
 +
 +    def remove(self, block: KVCacheBlock) -> None:
 +        if block.block_id in self._pinned_ids:
++            # Loaned out to a request. Keep its _pinned_by_hash reservation so
++            # insert() hands it straight back to the pin when it is freed.
++            self._pinned_ids.discard(block.block_id)
 +            self._pin.remove(block)
 +        elif block.block_id in self._t2_ids:
 +            self._t2.remove(block)
@@ -724,51 +806,69 @@ index 0000000..d3da580
 +        # Deliberately excludes self._pin: pinned blocks are not free.
 +        return self._t1.num_free_blocks + self._t2.num_free_blocks
 +
-+    def set_pinned(self, blocks: list[KVCacheBlock]) -> int:
-+        """Replace the never-evict set with *blocks*.
++    def set_pinned_hashes(
++        self, hashes: set[BlockHashWithGroupId], cap: int
++    ) -> int:
++        """Replace the never-evict hash set. Returns the blocks now reserved.
 +
-+        Re-homing is eager rather than lazy, because __len__() drives admission
-+        control and would otherwise report pinned blocks as available:
-+
-+        - blocks that lost their pin move out of the pin queue back into T1/T2;
-+        - blocks that gained a pin and are *already free* move out of T1/T2
-+          into the pin queue;
-+        - blocks that gained a pin while still in use (ref_cnt > 0, the usual
-+          case — the scheduler pins a request's blocks immediately before
-+          freeing them) are in no queue at all and get routed by insert().
++        Releasing the old pin is eager, because __len__() drives admission
++        control and would otherwise keep reporting the dropped blocks as
++        unavailable. Acquiring the new pin is lazy: blocks are claimed by
++        _acquire_pin() as they are freed, which is the whole point — the
++        marked request re-caches and releases its prefix while it runs, so one
++        pass of that request is enough to hold every block of it.
 +        """
-+        self._pinned_ids = {b.block_id for b in blocks}
-+        still_pinned: set[int] = set()
++        if hashes == self._pinned_hashes and cap == self._pin_cap:
++            # Same marked prompt as last time (the common case: every HA turn
++            # re-arms it). Nothing to re-home; churning the queue would only
++            # drop reservations we are about to rebuild.
++            return len(self._pinned_by_hash)
++
++        self._pinned_hashes = hashes
++        self._pin_cap = max(1, cap)
++        self._pin_cap_warned = False
++
++        kept: dict[BlockHashWithGroupId, int] = {}
 +        for block in self._pin.popleft_n(self._pin.num_free_blocks):
-+            if block.block_id in self._pinned_ids:
++            key = block.block_hash
++            if (
++                key is not None
++                and key in self._pinned_hashes
++                and key not in kept
++                and len(kept) < self._pin_cap
++            ):
++                kept[key] = block.block_id
 +                self._pin.append(block)
-+                still_pinned.add(block.block_id)
 +            elif block.block_id in self._t2_ids:
 +                self._t2.append(block)
 +            else:
 +                self._t1.append(block)
-+
-+        for block in blocks:
-+            if block.ref_cnt or block.is_null or block.block_id in still_pinned:
-+                continue
-+            # Free right now, so it is sitting in T1 or T2. Move it by hand:
-+            # self.remove() would consult the already-updated _pinned_ids and
-+            # look in the wrong queue.
-+            if block.block_id in self._t2_ids:
-+                self._t2.remove(block)
-+            else:
-+                self._t1.remove(block)
-+            self._pin.append(block)
-+
-+        return len(self._pinned_ids)
++        # Blocks on loan are in no queue; they lose their reservation here and
++        # re-acquire it (or not) via insert() when they come back.
++        self._pinned_by_hash = kept
++        self._pinned_ids = set(kept.values())
++        return len(kept)
 +
 +    # ------------------------------------------------------------------
 +    # Diagnostics / testing helpers
 +    # ------------------------------------------------------------------
 +
++    def pin_group_counts(self) -> dict[int, int]:
++        """group id -> blocks the pin has reserved for that group."""
++        counts: dict[int, int] = {}
++        for key in self._pinned_by_hash:
++            gid = get_group_id(key)
++            counts[gid] = counts.get(gid, 0) + 1
++        return counts
++
 +    @property
 +    def pin_size(self) -> int:
-+        """Number of pinned blocks currently held out of the free pool."""
++        """Blocks the pin has reserved (held, or on loan to a live request)."""
++        return len(self._pinned_by_hash)
++
++    @property
++    def pin_held(self) -> int:
++        """Blocks sitting in the pin queue right now."""
 +        return self._pin.num_free_blocks
 +
 +    @property
@@ -841,10 +941,35 @@ index 0000000..d3da580
 +    return cls()
 +
 diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
-index 89b1e84..bd8eeda 100644
+index 89b1e84..7f2f4cd 100644
 --- a/vllm/v1/core/kv_cache_coordinator.py
 +++ b/vllm/v1/core/kv_cache_coordinator.py
-@@ -75,6 +75,7 @@ class KVCacheCoordinator(ABC):
+@@ -4,7 +4,10 @@ from abc import ABC, abstractmethod
+ from collections.abc import Sequence
+ from typing import NamedTuple
+ 
++import os
++
+ from vllm import envs
++from vllm.logger import init_logger
+ from vllm.v1.core.block_pool import BlockPool
+ from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+ from vllm.v1.core.kv_cache_utils import (
+@@ -26,6 +29,13 @@ from vllm.v1.kv_cache_interface import (
+ )
+ from vllm.v1.request import Request
+ 
++logger = init_logger(__name__)
++
++# ponytail: VLLM_HIT_DEBUG=1 logs the per-group prefix-hit breakdown. Off by
++# default because it fires on every request; on, it is the only way to see
++# which KV cache group is truncating the cross-group fixed point.
++_HIT_DEBUG = os.environ.get("VLLM_HIT_DEBUG") == "1"
++
+ 
+ def _validate_prefix_cache_retention_interval(
+     retention_interval: int | None,
+@@ -75,6 +85,7 @@ class KVCacheCoordinator(ABC):
          scheduler_block_size: int,
          hash_block_size: int,
          metrics_collector: KVCacheMetricsCollector | None = None,
@@ -852,7 +977,7 @@ index 89b1e84..bd8eeda 100644
      ):
          self.kv_cache_config = kv_cache_config
          self.max_model_len = max_model_len
-@@ -93,6 +94,7 @@ class KVCacheCoordinator(ABC):
+@@ -93,6 +104,7 @@ class KVCacheCoordinator(ABC):
              hash_block_size=hash_block_size,
              enable_kv_cache_events=enable_kv_cache_events,
              metrics_collector=metrics_collector,
@@ -860,7 +985,7 @@ index 89b1e84..bd8eeda 100644
          )
  
          # KV cache group indices that get the EAGLE last-block drop.
-@@ -346,6 +348,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
+@@ -346,6 +358,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
          scheduler_block_size: int,
          hash_block_size: int,
          metrics_collector: KVCacheMetricsCollector | None = None,
@@ -868,7 +993,7 @@ index 89b1e84..bd8eeda 100644
      ):
          super().__init__(
              kv_cache_config,
-@@ -359,6 +362,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
+@@ -359,6 +372,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
              scheduler_block_size=scheduler_block_size,
              hash_block_size=hash_block_size,
              metrics_collector=metrics_collector,
@@ -876,7 +1001,7 @@ index 89b1e84..bd8eeda 100644
          )
          self.num_single_type_manager = len(self.single_type_managers)
  
-@@ -396,6 +400,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
+@@ -396,6 +410,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
          scheduler_block_size: int,
          hash_block_size: int,
          metrics_collector: KVCacheMetricsCollector | None = None,
@@ -884,7 +1009,7 @@ index 89b1e84..bd8eeda 100644
      ):
          super().__init__(
              kv_cache_config,
-@@ -409,6 +414,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
+@@ -409,6 +424,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
              scheduler_block_size=scheduler_block_size,
              hash_block_size=hash_block_size,
              metrics_collector=metrics_collector,
@@ -892,7 +1017,7 @@ index 89b1e84..bd8eeda 100644
          )
          self.kv_cache_spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
          self.block_size = self.kv_cache_spec.block_size
-@@ -482,6 +488,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+@@ -482,6 +498,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
          scheduler_block_size: int,
          hash_block_size: int,
          metrics_collector: KVCacheMetricsCollector | None = None,
@@ -900,7 +1025,7 @@ index 89b1e84..bd8eeda 100644
      ):
          super().__init__(
              kv_cache_config,
-@@ -495,6 +502,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+@@ -495,6 +512,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
              scheduler_block_size=scheduler_block_size,
              hash_block_size=hash_block_size,
              metrics_collector=metrics_collector,
@@ -908,7 +1033,34 @@ index 89b1e84..bd8eeda 100644
          )
          # hash_block_size: the block size used to compute block hashes.
          # The actual block size usually equals hash_block_size, but in cases where
-@@ -698,6 +706,7 @@ def get_kv_cache_coordinator(
+@@ -681,6 +699,26 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+                 if (blks := hit_blocks_by_group[group_id]) is not None:
+                     del blks[num_blocks:]
+ 
++        if _HIT_DEBUG:
++            # Which group truncated the cross-group fixed point? One short
++            # group drags hit_length down for all of them, so this is the only
++            # way to tell a real prefix miss from one group losing a block.
++            logger.info(
++                "[hit-debug] max=%d hit=%d | %s",
++                max_cache_hit_length,
++                hit_length,
++                " ".join(
++                    "g%d:%s/bs%d:%d"
++                    % (
++                        gid,
++                        type(g.kv_cache_spec).__name__.removesuffix("Spec"),
++                        g.kv_cache_spec.block_size,
++                        len(hit_blocks_by_group[gid] or []),
++                    )
++                    for gid, g in enumerate(self.kv_cache_config.kv_cache_groups)
++                ),
++            )
++
+         return tuple(
+             blocks if blocks is not None else [] for blocks in hit_blocks_by_group
+         ), hit_length
+@@ -698,6 +736,7 @@ def get_kv_cache_coordinator(
      scheduler_block_size: int,
      hash_block_size: int,
      metrics_collector: KVCacheMetricsCollector | None = None,
@@ -916,7 +1068,7 @@ index 89b1e84..bd8eeda 100644
  ) -> KVCacheCoordinator:
      if not enable_caching:
          return KVCacheCoordinatorNoPrefixCache(
-@@ -711,6 +720,7 @@ def get_kv_cache_coordinator(
+@@ -711,6 +750,7 @@ def get_kv_cache_coordinator(
              scheduler_block_size=scheduler_block_size,
              hash_block_size=hash_block_size,
              metrics_collector=metrics_collector,
@@ -924,7 +1076,7 @@ index 89b1e84..bd8eeda 100644
          )
      if len(kv_cache_config.kv_cache_groups) == 1:
          return UnitaryKVCacheCoordinator(
-@@ -725,6 +735,7 @@ def get_kv_cache_coordinator(
+@@ -725,6 +765,7 @@ def get_kv_cache_coordinator(
              scheduler_block_size=scheduler_block_size,
              hash_block_size=hash_block_size,
              metrics_collector=metrics_collector,
@@ -932,7 +1084,7 @@ index 89b1e84..bd8eeda 100644
          )
      return HybridKVCacheCoordinator(
          kv_cache_config,
-@@ -738,4 +749,5 @@ def get_kv_cache_coordinator(
+@@ -738,4 +779,5 @@ def get_kv_cache_coordinator(
          scheduler_block_size=scheduler_block_size,
          hash_block_size=hash_block_size,
          metrics_collector=metrics_collector,
@@ -958,15 +1110,11 @@ index 9f0bfc5..36af364 100644
          )
          self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
          self.block_pool = self.coordinator.block_pool
-diff --git a/vllm/v1/core/sched/__pycache__/scheduler.cpython-314.pyc b/vllm/v1/core/sched/__pycache__/scheduler.cpython-314.pyc
-new file mode 100644
-index 0000000..0ded02d
-Binary files /dev/null and b/vllm/v1/core/sched/__pycache__/scheduler.cpython-314.pyc differ
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index 08ab685..28d7e97 100644
+index 08ab685..0593bd8 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
-@@ -30,6 +30,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+@@ -30,12 +30,19 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
  from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
  from vllm.multimodal.encoder_budget import MultiModalBudget
  from vllm.multimodal.utils import get_mm_features_in_window
@@ -974,7 +1122,19 @@ index 08ab685..28d7e97 100644
  from vllm.v1.core.encoder_cache_manager import (
      EncoderCacheManager,
      EncoderDecoderCacheManager,
-@@ -62,6 +63,27 @@ from vllm.v1.utils import record_function_or_nullcontext
+ )
+ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+ from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
++from vllm.v1.core.kv_cache_utils import (
++    BlockHashList,
++    BlockHashListWithBlockSize,
++    BlockHashWithGroupId,
++    make_block_hash_with_group_id,
++)
+ from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
+ from vllm.v1.core.sched.output import (
+     CachedRequestData,
+@@ -62,6 +69,27 @@ from vllm.v1.utils import record_function_or_nullcontext
  logger = init_logger(__name__)
  
  
@@ -1002,7 +1162,7 @@ index 08ab685..28d7e97 100644
  class Scheduler(SchedulerInterface):
      def __init__(
          self,
-@@ -245,7 +267,49 @@ class Scheduler(SchedulerInterface):
+@@ -245,7 +273,56 @@ class Scheduler(SchedulerInterface):
              scheduler_block_size=self.block_size,
              hash_block_size=hash_block_size,
              metrics_collector=self.kv_metrics_collector,
@@ -1010,10 +1170,9 @@ index 08ab685..28d7e97 100644
          )
 +
 +        # --never-evict-kv-cache-prompt-includes: token-id needle matched
-+        # against every new request's prompt, and the ids of requests that
-+        # matched (consumed when their blocks are freed).
++        # against every new request's prompt.
 +        self._pin_needle: list[int] = []
-+        self._pin_req_ids: set[str] = set()
++        self._pin_hash_block_size = hash_block_size
 +        self._pin_page_sizes = [
 +            g.kv_cache_spec.page_size_bytes for g in kv_cache_config.kv_cache_groups
 +        ]
@@ -1042,75 +1201,109 @@ index 08ab685..28d7e97 100644
 +                # A long sentence's interior tokens are stable. Upgrade path if
 +                # a marker ever fails to match: decode the prompt and use `in`.
 +                self._pin_needle = ids[1:-1] if len(ids) > 2 else ids
++                num_gpu_blocks = self.kv_cache_manager.block_pool.num_gpu_blocks
 +                logger.info(
 +                    "[never-evict] armed: %d-token marker, pin capped at %d "
-+                    "blocks (25%% of %d)",
++                    "blocks (%.0f%% of %d)",
 +                    len(self._pin_needle),
-+                    max(1, self.kv_cache_manager.block_pool.num_gpu_blocks // 4),
-+                    self.kv_cache_manager.block_pool.num_gpu_blocks,
++                    max(
++                        1,
++                        int(
++                            num_gpu_blocks
++                            * self.cache_config.never_evict_kv_cache_max_fraction
++                        ),
++                    ),
++                    100 * self.cache_config.never_evict_kv_cache_max_fraction,
++                    num_gpu_blocks,
 +                )
          # Bind GPU block pool to the KV connector. This must happen after
          # kv_cache_manager is constructed so block_pool is available.
          if self.connector is not None:
-@@ -1827,6 +1891,16 @@ class Scheduler(SchedulerInterface):
+@@ -1827,6 +1904,10 @@ class Scheduler(SchedulerInterface):
                  self.connector.on_new_request(request)
              if self.log_stats:
                  request.record_event(EngineCoreEventType.QUEUED)
 +            if self._pin_needle and _contains_subseq(
 +                request.prompt_token_ids or [], self._pin_needle
 +            ):
-+                self._pin_req_ids.add(request.request_id)
-+                logger.info(
-+                    "[never-evict] marker matched in request %s (%d prompt "
-+                    "tokens); its blocks will be pinned when it finishes",
-+                    request.request_id,
-+                    request.num_prompt_tokens,
-+                )
++                self._arm_never_evict_pin(request)
  
      def finish_requests(
          self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
-@@ -1912,9 +1986,46 @@ class Scheduler(SchedulerInterface):
- 
-     def _free_blocks(self, request: Request):
-         assert request.is_finished()
-+        if request.request_id in self._pin_req_ids:
-+            self._update_never_evict_pin(request)
+@@ -1915,6 +1996,78 @@ class Scheduler(SchedulerInterface):
          self.kv_cache_manager.free(request)
          del self.requests[request.request_id]
  
-+    def _update_never_evict_pin(self, request: Request) -> None:
-+        """Pin this request's blocks, replacing whatever was pinned before.
++    def _arm_never_evict_pin(self, request: Request) -> None:
++        """Pin the marked prompt's prefix, replacing whatever was pinned before.
 +
-+        Called just before the blocks are freed, i.e. at the exact moment they
-+        become eviction candidates. Replacing (rather than adding to) the set
-+        is what makes a changed system prompt release the old blocks.
++        Armed when the request *arrives*, not when it finishes: a hybrid model
++        releases cached blocks while the request is still running (mamba/GDN
++        groups free their state block every step via remove_skipped_blocks), so
++        by the time it finishes those blocks are already ordinary eviction
++        candidates. Arming up front means each one is claimed by the pin at the
++        moment it is freed.
++
++        The pin is a set of block *hashes*, so it survives the blocks moving
++        around. Replacing (rather than adding to) the set is what makes a
++        changed system prompt release the old blocks by itself.
 +        """
-+        self._pin_req_ids.discard(request.request_id)
 +        block_pool = self.kv_cache_manager.block_pool
-+        groups = self.kv_cache_manager.get_block_ids(request.request_id)
-+        # Group 0 (attention) first, so it survives the cap; the per-request
-+        # mamba/GDN state blocks at the tail are the ones worth dropping.
-+        pinned = block_pool.set_pinned_blocks([b for g in groups for b in g])
-+        num_bytes = sum(
-+            len(pinned.intersection(group)) * page_size
-+            for group, page_size in zip(groups, self._pin_page_sizes)
-+        )
-+        # Per group: how many blocks the request still held vs how many of them
-+        # ended up pinned. A group whose pinned count trails its allocation is
-+        # either losing blocks to the cap or handing back null/trimmed blocks.
-+        per_group = "|".join(
-+            f"{len(pinned.intersection(g))}/{len(g)}" for g in groups
++        # Report what the outgoing pin managed to hold before replacing it.
++        # Every HA turn re-arms, so this is the steady-state readout.
++        self.log_never_evict_pin()
++        hashes: set[BlockHashWithGroupId] = set()
++        for gid, group in enumerate(self.kv_cache_config.kv_cache_groups):
++            block_size = group.kv_cache_spec.block_size
++            # Groups coarser than hash_block_size key their cache entries on
++            # *combined* hashes — the same conversion find_longest_cache_hit
++            # does, so reuse it rather than cross-producing the fine hashes.
++            group_hashes: BlockHashList = (
++                request.block_hashes
++                if block_size == self._pin_hash_block_size
++                else BlockHashListWithBlockSize(
++                    request.block_hashes, self._pin_hash_block_size, block_size
++                )
++            )
++            for i in range(
++                min(len(group_hashes), request.num_prompt_tokens // block_size)
++            ):
++                hashes.add(make_block_hash_with_group_id(group_hashes[i], gid))
++
++        reserved = block_pool.set_pinned_hashes(
++            hashes, self.cache_config.never_evict_kv_cache_max_fraction
 +        )
 +        logger.info(
-+            "[never-evict] pin updated from request %s: %d blocks, %.1f MiB, "
-+            "%.2f%% of the KV pool (%d blocks still free); per-group "
-+            "pinned/held %s",
++            "[never-evict] armed from request %s (%d prompt tokens): %d hashes "
++            "over %d groups, %d blocks already reserved, %d free",
 +            request.request_id,
-+            len(pinned),
-+            num_bytes / (1 << 20),
-+            100.0 * len(pinned) / block_pool.num_gpu_blocks,
++            request.num_prompt_tokens,
++            len(hashes),
++            len(self.kv_cache_config.kv_cache_groups),
++            reserved,
 +            block_pool.get_num_free_blocks(),
-+            per_group,
++        )
++
++    def log_never_evict_pin(self) -> None:
++        """Log what the pin actually holds. Cheap; called from the stats path."""
++        block_pool = self.kv_cache_manager.block_pool
++        reserved, held, per_group = block_pool.get_pin_stats()
++        if not reserved:
++            return
++        num_bytes = sum(
++            count * self._pin_page_sizes[gid] for gid, count in per_group.items()
++        )
++        logger.info(
++            "[never-evict] holding %d blocks (%d in the pin queue, rest on "
++            "loan), %.1f MiB, %.2f%% of the KV pool; per-group %s",
++            reserved,
++            held,
++            num_bytes / (1 << 20),
++            100.0 * reserved / block_pool.num_gpu_blocks,
++            "|".join(
++                f"g{gid}:{per_group.get(gid, 0)}"
++                for gid in range(len(self.kv_cache_config.kv_cache_groups))
++            ),
 +        )
 +
      @property
@@ -1118,10 +1311,10 @@ index 08ab685..28d7e97 100644
          return self._pause_state
 diff --git a/vllm/v1/core/test_eviction_policy.py b/vllm/v1/core/test_eviction_policy.py
 new file mode 100644
-index 0000000..19815dc
+index 0000000..67a9e21
 --- /dev/null
 +++ b/vllm/v1/core/test_eviction_policy.py
-@@ -0,0 +1,771 @@
+@@ -0,0 +1,850 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Unit tests for GPU KV cache eviction policies.
@@ -1750,7 +1943,7 @@ index 0000000..19815dc
 +        pool.touch([blocks[0]])
 +        assert pool.get_num_free_blocks() == 18
 +
-+        blocks[0].ref_cnt -= 1
++        # free_blocks() does the decrement itself.
 +        pool.free_blocks([blocks[0]])
 +        assert pool.get_num_free_blocks() == 19
 +
@@ -1786,6 +1979,12 @@ index 0000000..19815dc
 +# ---------------------------------------------------------------------------
 +
 +
++def _hash(i: int, group_id: int = 0):
++    from vllm.v1.core.kv_cache_utils import BlockHash, make_block_hash_with_group_id
++
++    return make_block_hash_with_group_id(BlockHash(b"hash-%04d" % i), group_id)
++
++
 +class TestPinning:
 +    def _make_pool(self, num_blocks: int = 100):
 +        from vllm.v1.core.block_pool import BlockPool
@@ -1797,29 +1996,97 @@ index 0000000..19815dc
 +            eviction_policy="arc",
 +        )
 +
++    def _cached(self, pool, n: int, first: int = 0, group_id: int = 0):
++        """n blocks carrying hashes, as cache_full_blocks would leave them.
++
++        Registering in cached_block_hash_to_block matters: that map is what
++        _maybe_evict_cached_block consults to reset a hash on reuse, so
++        without it an evicted block would keep a stale hash and the test
++        could not tell a survivor from a recycled block.
++        """
++        blocks = pool.get_new_blocks(n)
++        for offset, block in enumerate(blocks):
++            key = _hash(first + offset, group_id)
++            block.block_hash = key
++            pool.cached_block_hash_to_block.insert(key, block)
++        return blocks
++
 +    def test_pinned_blocks_are_not_free(self):
 +        """A hard pin must leave the free count, or the scheduler would hand
 +        the blocks out and evict_n would have to break the guarantee."""
 +        pool = self._make_pool()
-+        blocks = pool.get_new_blocks(5)
-+        pool.free_blocks(list(reversed(blocks)))
-+        assert pool.get_num_free_blocks() == 99
++        blocks = self._cached(pool, 5)
++        pool.set_pinned_hashes({b.block_hash for b in blocks}, 0.25)
 +
-+        pinned = pool.set_pinned_blocks([b.block_id for b in blocks])
-+        assert len(pinned) == 5
++        pool.free_blocks(list(reversed(blocks)))
 +        assert pool.get_num_free_blocks() == 94
++        assert pool._policy.pin_size == 5
++
++    def test_survives_mid_request_free_then_churn(self):
++        """The regression this pin exists for.
++
++        A hybrid model hands cached blocks back *while the request is still
++        running* — MambaManager.get_num_skipped_tokens() is
++        num_computed_tokens - 1, so remove_skipped_blocks() frees the state
++        block on every step. The old id-keyed pin snapshotted the block table
++        when the request finished and so never saw them; churn then evicted
++        them, and because find_longest_cache_hit is a fixed point across all
++        KV cache groups, that one group's miss truncated the whole hit to 0.
++
++        The property that fixes it, and the one asserted here: the pin is
++        armed from what the request knows on arrival (its hashes) and claimed
++        lazily as blocks are freed, so a block freed at *any* point in the
++        request's life is held. The old API could not express this — it needed
++        block ids, which are only knowable after the fact.
++        """
++        pool = self._make_pool(100)
++        prefix = self._cached(pool, 8)
++        pool.set_pinned_hashes({b.block_hash for b in prefix}, 0.25)
++
++        # Mid-request release: the request is nowhere near finished, but these
++        # blocks are already back in the pool.
++        pool.free_blocks(list(reversed(prefix)))
++        prefix_ids = {b.block_id for b in prefix}
++
++        # Now churn far past the pool's capacity.
++        for round_ in range(20):
++            junk = self._cached(pool, 50, first=1000 + round_ * 50)
++            pool.free_blocks(list(reversed(junk)))
++
++        assert pool._policy.pin_size == 8
++        for block in prefix:
++            assert block.block_id in prefix_ids
++            assert block.block_hash is not None, "hash was reset -> block reused"
++            assert pool.cached_block_hash_to_block.get_one_block(block.block_hash) is (
++                block
++            )
++
++    def test_loaned_pinned_block_comes_back_to_the_pin(self):
++        """A prefix hit takes a pinned block out on loan; it must return."""
++        pool = self._make_pool()
++        blocks = self._cached(pool, 4)
++        pool.set_pinned_hashes({b.block_hash for b in blocks}, 0.25)
++        pool.free_blocks(list(reversed(blocks)))
++        assert pool._policy.pin_held == 4
++
++        pool.touch(blocks)  # prefix-cache hit
++        assert pool._policy.pin_held == 0
++        assert pool._policy.pin_size == 4  # still reserved, just on loan
++        assert pool.get_num_free_blocks() == 95
++
++        pool.free_blocks(list(reversed(blocks)))
++        assert pool._policy.pin_held == 4
++        assert pool.get_num_free_blocks() == 95
 +
 +    def test_evict_n_never_returns_pinned(self):
 +        pool = self._make_pool()
-+        keep = pool.get_new_blocks(4)
-+        churn = pool.get_new_blocks(20)
++        keep = self._cached(pool, 4)
++        churn = self._cached(pool, 20, first=100)
++        pool.set_pinned_hashes({b.block_hash for b in keep}, 0.25)
 +        pool.free_blocks(list(reversed(keep)))
 +        pool.free_blocks(list(reversed(churn)))
 +
 +        keep_ids = {b.block_id for b in keep}
-+        pool.set_pinned_blocks(list(keep_ids))
-+
-+        # Drain everything the pool is willing to give up.
 +        evicted = pool._policy.evict_n(pool.get_num_free_blocks())
 +        assert not keep_ids.intersection(b.block_id for b in evicted)
 +        assert pool.get_num_free_blocks() == 0
@@ -1828,42 +2095,47 @@ index 0000000..19815dc
 +    def test_new_pin_releases_the_old_one(self):
 +        """A new marker prompt replaces the pin set; the old blocks go back."""
 +        pool = self._make_pool()
-+        old = pool.get_new_blocks(3)
-+        new = pool.get_new_blocks(3)
++        old = self._cached(pool, 3)
++        new = self._cached(pool, 3, first=50)
++
++        pool.set_pinned_hashes({b.block_hash for b in old}, 0.25)
 +        pool.free_blocks(list(reversed(old)))
 +        pool.free_blocks(list(reversed(new)))
-+
-+        pool.set_pinned_blocks([b.block_id for b in old])
 +        assert pool._policy.pin_size == 3
 +        free_with_old_pinned = pool.get_num_free_blocks()
 +
-+        pool.set_pinned_blocks([b.block_id for b in new])
++        pool.set_pinned_hashes({b.block_hash for b in new}, 0.25)
++        # `new` is already sitting in T1, so the pin is acquired lazily, the
++        # next time those blocks pass through insert(). In the real flow the
++        # marked request touches them (prefix hit) and frees them again.
++        pool.touch(new)
++        pool.free_blocks(list(reversed(new)))
 +        assert pool._policy.pin_size == 3
 +        assert pool.get_num_free_blocks() == free_with_old_pinned
 +
 +        # The released blocks are evictable again, the newly pinned ones are
 +        # not. Released blocks re-enter at T1's tail (MRU) rather than its
-+        # head: having just been pinned they are the last thing worth
-+        # dropping, so drain the whole pool rather than assuming an order.
-+        evicted_ids = {b.block_id for b in pool._policy.evict_n(96)}
++        # head, so drain the whole pool rather than assuming an order.
++        evicted_ids = {
++            b.block_id for b in pool._policy.evict_n(pool.get_num_free_blocks())
++        }
 +        assert {b.block_id for b in old}.issubset(evicted_ids)
 +        assert not evicted_ids.intersection(b.block_id for b in new)
 +
-+    def test_pin_is_capped_at_ten_percent(self):
++    def test_pin_is_capped(self):
 +        pool = self._make_pool(100)
-+        blocks = pool.get_new_blocks(50)
-+        pool.free_blocks(list(reversed(blocks)))
++        blocks = self._cached(pool, 50)
 +
-+        pinned = pool.set_pinned_blocks([b.block_id for b in blocks])
-+        assert len(pinned) == 10  # 100 // 10
-+        # The cap keeps the head of the list — that is the shared prefix.
-+        assert pinned == {b.block_id for b in blocks[:10]}
++        pool.set_pinned_hashes({b.block_hash for b in blocks}, 0.25)
++        pool.free_blocks(list(reversed(blocks)))
++        assert pool._policy.pin_size == 25  # 25% of 100
++        assert pool.get_num_free_blocks() == 74  # 99 free - 25 pinned
 +
 +    def test_reset_prefix_cache_drops_pins(self):
 +        pool = self._make_pool()
-+        blocks = pool.get_new_blocks(5)
++        blocks = self._cached(pool, 5)
++        pool.set_pinned_hashes({b.block_hash for b in blocks}, 0.25)
 +        pool.free_blocks(list(reversed(blocks)))
-+        pool.set_pinned_blocks([b.block_id for b in blocks])
 +        assert pool.get_num_free_blocks() == 94
 +
 +        assert pool.reset_prefix_cache() is True

@@ -304,6 +304,7 @@ start_server() {
         -e HF_HOME=/hf -e VLLM_CACHE_ROOT=/hf/.vllm_cache -e PORT="$PORT" -e MAX_MODEL_LEN="$CTX" -e GPU_MEM="$GPU_MEM" \
         -e MAX_NUM_SEQS="$MAX_NUM_SEQS" -e MAX_BATCHED_TOKENS="$MAX_BATCHED_TOKENS" ${HF_TOKEN:+-e HF_TOKEN="$HF_TOKEN"} \
         ${NEVER_EVICT_PROMPT+-e NEVER_EVICT_PROMPT="$NEVER_EVICT_PROMPT"} \
+        ${NEVER_EVICT_MAX_FRACTION+-e NEVER_EVICT_MAX_FRACTION="$NEVER_EVICT_MAX_FRACTION"} \
         "${model_env[@]}" \
         -v "$HF_HOME:/hf" -v "$REPO_DIR/runtime:/host:ro" "${mounts[@]}" \
         --entrypoint bash "$IMAGE" "$wrapper" $serve_args >/dev/null
